@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import json
 import sys
+import re
 from pathlib import Path
 
 import ffmpeg # Requires 'ffmpeg-python' library
@@ -59,6 +60,40 @@ def _get_video_metadata(video_path: Path) -> dict:
         raise RuntimeError(f"Could not get video metadata for {video_path}.")
 
 
+def _rename_frames_with_timestamps(output_dir: Path, target_fps: float):
+    """
+    Renames temporary frame files (e.g., 'tmp_frame_0001.png') to include a timestamp 
+    (e.g., 'frame_0001_0.5s.png').
+    """
+    frames_renamed = 0
+    # Pattern to find the sequential number in the temporary filename
+    temp_frame_pattern = re.compile(r"tmp_frame_(\d{4})\.png")
+
+    # It's good practice to sort the glob results to ensure sequential processing
+    for frame_file in sorted(output_dir.glob("tmp_frame_*.png")):
+        match = temp_frame_pattern.match(frame_file.name)
+        if not match:
+            continue
+        
+        frame_number = int(match.group(1))
+        # ffmpeg's %d format for image sequences is 1-based.
+        # The timestamp is the frame's position in the sequence divided by the frame rate.
+        timestamp = (frame_number - 1) / target_fps
+        
+        # Format to 3 decimal places (milliseconds) to avoid filename collisions
+        # due to rounding when using high FPS, and remove the frame number.
+        new_name = f"frame_{timestamp:.2f}s.png"
+        new_path = frame_file.with_name(new_name)
+        
+        try:
+            frame_file.rename(new_path)
+            frames_renamed += 1
+        except OSError as rename_error:
+            logger.error(f"Failed to rename {frame_file} to {new_path}: {rename_error}")
+
+
+# ffmpeg limits us on how we could name the extracted frames initially,
+# so we've got to manually rename them now, to include timestamp such as _1.2s
 def extract_frames(video_path: Path, output_dir: Path, num_frames: int = None, interval_sec: float = None):
     """
     Extracts frames from a single video.
@@ -91,19 +126,26 @@ def extract_frames(video_path: Path, output_dir: Path, num_frames: int = None, i
             logger.error(f"Invalid target FPS for {video_path}. Frame extraction aborted.")
             return
 
+        # Clear existing directory before extraction
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_pattern = output_dir / "frame_%04d.png"
+        # Use a temporary name pattern to avoid conflicts during renaming
+        temp_output_pattern = output_dir / "tmp_frame_%04d.png"
         
         stream = ffmpeg.input(str(video_path))
         stream = ffmpeg.filter(stream, 'fps', fps=target_fps)
-        stream = ffmpeg.output(stream, str(output_pattern), vsync='0') 
+        stream = ffmpeg.output(stream, str(temp_output_pattern), vsync='0') 
 
         ffmpeg_cmd = ffmpeg.compile(stream)
-        logger.info(f"FFmpeg command for {video_path.name}: {' '.join(ffmpeg_cmd)}")
 
         try:
-            process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Frames extracted to: '{output_dir}'")
+            subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+            logger.info(f"Successfully extracted frames to temporary files in: '{output_dir}'")
+            
+            _rename_frames_with_timestamps(output_dir, target_fps)
+
         except subprocess.CalledProcessError as e:
             logger.error(f"FFmpeg process failed for {video_path.name}: STDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
             raise RuntimeError("FFmpeg failed during extraction.")
@@ -134,14 +176,17 @@ def delete_frames(target_path: Path):
     if not frames_dir_to_clean.is_dir():
         raise ValueError(f"Resolved path is not a directory: '{frames_dir_to_clean}'.")
 
-    png_files = list(frames_dir_to_clean.glob("*.png"))
+    # Look for both final frames and any leftover temporary frames
+    final_frames = list(frames_dir_to_clean.glob("frame_*.png"))
+    temp_frames = list(frames_dir_to_clean.glob("tmp_frame_*.png"))
+    png_files_to_delete = final_frames + temp_frames
     
-    if not png_files:
-        logger.info(f"No .png files found in '{frames_dir_to_clean}'.")
+    if not png_files_to_delete:
+        logger.info(f"No frame files (.png) found in '{frames_dir_to_clean}'.")
         return
 
-    logger.info(f"Deleting {len(png_files)} .png files from: '{frames_dir_to_clean}'.")
-    for p_file in png_files:
+    logger.info(f"Deleting {len(png_files_to_delete)} .png files from: '{frames_dir_to_clean}'.")
+    for p_file in png_files_to_delete:
         try:
             os.remove(p_file)
         except OSError as e:
